@@ -17,9 +17,14 @@
 #  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
 #  MA 02110-1301, USA.
 
+import asyncio
 import logging
-from pysnmp.hlapi import setCmd, SnmpEngine, UsmUserData, UdpTransportTarget, ContextData, CommunityData, ObjectType, ObjectIdentity
-import pysnmp.hlapi as pysnmp_api
+from pysnmp.hlapi.v3arch.asyncio import (
+    set_cmd, SnmpEngine, UsmUserData, UdpTransportTarget,
+    ContextData, CommunityData, ObjectType, ObjectIdentity,
+    Integer32,
+)
+import pysnmp.hlapi.v3arch.asyncio as pysnmp_api
 from pdudaemon.drivers.driver import PDUDriver, FailedRequestException, UnknownCommandException
 import os
 log = logging.getLogger("pdud.drivers." + os.path.basename(__file__))
@@ -30,11 +35,12 @@ class SNMP(PDUDriver):
     def __init__(self, hostname, settings):
         self.hostname = hostname
         self.version = settings['driver']
-        self.mib = settings['mib']
+        self.mib = settings.get('mib', None)
+        self.oid = settings.get('oid', None)
         self.authpass = settings.get('authpassphrase', None)
         self.privpass = settings.get('privpassphrase', None)
         self.community = settings.get('community', None)
-        self.controlpoint = settings['controlpoint']
+        self.controlpoint = settings.get('controlpoint', None)
         self.username = settings.get('username', None)
         self.onsetting = settings['onsetting']
         self.offsetting = settings['offsetting']
@@ -42,6 +48,7 @@ class SNMP(PDUDriver):
         self.static_ending = settings.get('static_ending', None)
         self.auth_protocol = settings.get('auth_protocol', None)
         self.priv_protocol = settings.get('priv_protocol', None)
+        self.engine = SnmpEngine()
         super(SNMP, self).__init__()
 
     @classmethod
@@ -60,22 +67,19 @@ class SNMP(PDUDriver):
             set_bit = self.offsetting
         else:
             raise UnknownCommandException("Unknown command %s." % (command))
+        set_bit = int(set_bit)
 
-        transport = UdpTransportTarget((self.hostname, 161))
+        asyncio.run(self._port_interaction_async(set_bit, port_number))
 
-        if self.inside_number:
-            # It is possible to pass 2 or 3 snmp argument values
-            filled_controlpoint = self.controlpoint.replace('*', str(port_number))
-            indexed_object_list = [self.mib, filled_controlpoint]
-            # If there is a key static_ending available, add a static ending value
-            if self.static_ending is not None:
-                indexed_object_list.append(int(self.static_ending))
+    async def _port_interaction_async(self, set_bit, port_number):
+        transport = await UdpTransportTarget.create((self.hostname, 161))
+
+        if self.mib is not None and self.oid is None:
+            objecttype = self._get_objecttype_mib(set_bit, port_number)
+        elif self.oid is not None and self.mib is None:
+            objecttype = self._get_objecttype_oid(set_bit, port_number)
         else:
-            indexed_object_list = [self.mib, self.controlpoint, port_number]
-
-        objecttype = ObjectType(
-            ObjectIdentity(*indexed_object_list).addAsn1MibSource(
-                'http://mibs.snmplabs.com/asn1/@mib@'), int(set_bit))
+            raise FailedRequestException("Either 'mib' or 'oid' setting must be configured")
 
         if self.version == 'snmpv3':
             if not self.username:
@@ -91,25 +95,20 @@ class SNMP(PDUDriver):
                 protocols['privProtocol'] = p_protocol
 
             userdata = UsmUserData(self.username, self.authpass, self.privpass, **protocols)
-            errorIndication, errorStatus, errorIndex, varBinds = next(
-                setCmd(SnmpEngine(),
-                       userdata,
-                       transport,
-                       ContextData(),
-                       objecttype)
-            )
         elif self.version == 'snmpv1':
             if not self.community:
                 raise FailedRequestException("No community set for snmpv1")
-            errorIndication, errorStatus, errorIndex, varBinds = next(
-                setCmd(SnmpEngine(),
-                       CommunityData(self.community),
-                       transport,
-                       ContextData(),
-                       objecttype)
-            )
+            userdata = CommunityData(self.community)
         else:
             raise FailedRequestException("Unknown snmp version")
+
+        errorIndication, errorStatus, errorIndex, varBinds = await set_cmd(
+            self.engine,
+            userdata,
+            transport,
+            ContextData(),
+            objecttype,
+        )
 
         if errorIndication:
             raise FailedRequestException(errorIndication)
@@ -119,3 +118,27 @@ class SNMP(PDUDriver):
             for varBind in varBinds:
                 log.debug(' = '.join([x.prettyPrint() for x in varBind]))
             return True
+
+    def _get_objecttype_mib(self, set_bit, port_number):
+        if self.inside_number:
+            # It is possible to pass 2 or 3 snmp argument values
+            filled_controlpoint = self.controlpoint.replace('*', str(port_number))
+            indexed_object_list = [self.mib, filled_controlpoint]
+            # If there is a key static_ending available, add a static ending value
+            if self.static_ending is not None:
+                indexed_object_list.append(int(self.static_ending))
+        else:
+            indexed_object_list = [self.mib, self.controlpoint, port_number]
+
+        objecttype = ObjectType(
+            ObjectIdentity(*indexed_object_list).add_asn1_mib_source(
+                'https://mibs.pysnmp.com/asn1/@mib@'), set_bit)
+
+        return objecttype
+
+    def _get_objecttype_oid(self, set_bit, port_number):
+        oid = self.oid.replace('*', str(port_number))
+
+        objecttype = ObjectType(ObjectIdentity(oid), Integer32(set_bit))
+
+        return objecttype
